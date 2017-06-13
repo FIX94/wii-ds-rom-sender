@@ -26,6 +26,8 @@ enum {
 };
 
 static volatile bool mpdl_active = false;
+static volatile bool wd_has_rsa = true;
+static volatile bool wd_hdr_valid = true;
 static volatile uint8_t wd_namestate = 0;
 static volatile uint32_t wd_idle = 0;
 static volatile uint16_t wd_last_datapos = 0;
@@ -274,7 +276,8 @@ static void wdDoSend(const uint8_t *send_buf, const u32 in_len)
 	if(ret) printf("SendFrame Err %lx\n", ret);
 }
 
-static uint8_t *srlBuf;
+static uint8_t srlHdr[0x160];
+static uint8_t srlRSA[0x88];
 static uint8_t *arm_databuf;
 static uint32_t arm_datalen_total;
 static uint16_t arm_datapkg_total;
@@ -300,27 +303,24 @@ static void* mpdl_send_thread(void * nul)
 			else if(wd_state == WD_STATE_SENDRSA)
 			{
 				memcpy(wdSendBuf, rsa_msg_start, sizeof(rsa_msg_start));
-				memcpy(wdSendBuf+0x3, srlBuf+0x24, 4); //ARM9 Entry
-				memcpy(wdSendBuf+0x7, srlBuf+0x34, 4); //ARM7 Entry
+				memcpy(wdSendBuf+0x3, srlHdr+0x24, 4); //ARM9 Entry
+				memcpy(wdSendBuf+0x7, srlHdr+0x34, 4); //ARM7 Entry
 				uint32_t tmp = __builtin_bswap32(0x027FFE00);
 				memcpy(wdSendBuf+0xF, &tmp, 4); //Header Dest 1
 				memcpy(wdSendBuf+0x13, &tmp, 4); //Header Dest 2
 				tmp = __builtin_bswap32(0x160);
 				memcpy(wdSendBuf+0x17, &tmp, 4); //Header Len
-				memcpy(wdSendBuf+0x1F, srlBuf+0x28, 4); //ARM9 Dest (tmp)
-				memcpy(wdSendBuf+0x23, srlBuf+0x28, 4); //ARM9 Dest (actual)
-				memcpy(wdSendBuf+0x27, srlBuf+0x2C, 4); //ARM9 Size
+				memcpy(wdSendBuf+0x1F, srlHdr+0x28, 4); //ARM9 Dest (tmp)
+				memcpy(wdSendBuf+0x23, srlHdr+0x28, 4); //ARM9 Dest (actual)
+				memcpy(wdSendBuf+0x27, srlHdr+0x2C, 4); //ARM9 Size
 				tmp = __builtin_bswap32(0x022C0000);
 				memcpy(wdSendBuf+0x2F, &tmp, 4); //ARM7 Dest (tmp)
-				memcpy(wdSendBuf+0x33, srlBuf+0x38, 4); //ARM7 Dest (actual)
-				memcpy(wdSendBuf+0x37, srlBuf+0x3C, 4); //ARM7 Size
+				memcpy(wdSendBuf+0x33, srlHdr+0x38, 4); //ARM7 Dest (actual)
+				memcpy(wdSendBuf+0x37, srlHdr+0x3C, 4); //ARM7 Size
 				tmp = __builtin_bswap32(1);
 				memcpy(wdSendBuf+0x3B, &tmp, 4); //RSA Header End
-				//RSA Data Prep
-				memcpy(&tmp, srlBuf+0x80, 4);
-				uint32_t romlen = __builtin_bswap32(tmp);
-				//RSA Data
-				memcpy(wdSendBuf+0x3F, srlBuf+romlen, 0x88);
+				if(wd_has_rsa) //RSA Data
+					memcpy(wdSendBuf+0x3F, srlRSA, 0x88);
 				memcpy(wdSendBuf+0xE8, msg_end, sizeof(msg_end));
 				//printf("Sending RSA Signature\n");
 				wdDoSend(wdSendBuf, 0xEA);
@@ -333,7 +333,7 @@ static void* mpdl_send_thread(void * nul)
 					memcpy(wdSendBuf, hdr_msg_start, sizeof(hdr_msg_start));
 					uint16_t tmp = __builtin_bswap16(wd_datapos);
 					memcpy(wdSendBuf+5, &tmp, 2);
-					memcpy(wdSendBuf+7, srlBuf, 0x160);
+					memcpy(wdSendBuf+7, srlHdr, 0x160);
 					memcpy(wdSendBuf+0x168, msg_end, sizeof(msg_end));
 					wdDoSend(wdSendBuf, 0x16A);
 				}
@@ -392,11 +392,15 @@ static void printmain()
 {
 	printf("\x1b[2J");
 	printf("\x1b[37m");
-	printf("Wii DS ROM Sender v1.0 by FIX94\n\n");
+	printf("Wii DS ROM Sender v1.1 by FIX94\n\n");
 }
 
 static void printstatus()
 {
+	if(!wd_hdr_valid)
+		printf("WARNING: ROM Header appears to be invalid, it may not work\n");
+	if(!wd_has_rsa)
+		printf("WARNING: ROM unsigned, it will only work on a DS with FlashMe\n");
 	printf("Current Status:\n");
 	if(!inited)
 		printf("Initializing System, this may take a while\n");
@@ -431,7 +435,30 @@ typedef struct _srlNames {
 } srlNames;
 
 static int compare (const void * a, const void * b ) {
-  return strcmp((*(srlNames*)a).name, (*(srlNames*)b).name);
+	return strcmp((*(srlNames*)a).name, (*(srlNames*)b).name);
+}
+
+//DS CRC16 Function
+static const uint16_t crcTbl[16] = {
+	0x0000, 0xCC01, 0xD801, 0x1400, 0xF001, 0x3C00, 0x2800, 0xE401,
+	0xA001, 0x6C00, 0x7800, 0xB401, 0x5000, 0x9C01, 0x8801, 0x4400,
+};
+static bool dsVerifyHdr()
+{
+	uint16_t crc = 0xFFFF;
+	int i, j;
+	for(i = 0; i < 0x15E; i+=2)
+	{
+		uint16_t curval = srlHdr[i]|(srlHdr[i+1]<<8);
+		for(j = 0; j < 0x10; j+= 4)
+		{
+			uint16_t tmp = crcTbl[crc&0xF]^crcTbl[(curval>>j)&0xF];
+			crc >>= 4;
+			crc ^= tmp;
+		}
+	}
+	uint16_t inCrc = srlHdr[0x15E]|(srlHdr[0x15F]<<8);
+	return (crc == inCrc);
 }
 
 int main() 
@@ -466,33 +493,36 @@ int main()
 	fatInitDefault();
 	int srlCnt = 0;
 	DIR *dir = opendir("/srl");
-	struct dirent *dent;
-	srlNames *names;
-    if(dir!=NULL)
-    {
-        while((dent=readdir(dir))!=NULL)
+	struct dirent *dent = NULL;
+	srlNames *names = NULL;
+	if(dir!=NULL)
+	{
+		while((dent=readdir(dir))!=NULL)
 		{
-            if(strstr(dent->d_name,".srl") != NULL
+			if(strstr(dent->d_name,".srl") != NULL
 				|| strstr(dent->d_name,".nds") != NULL)
 				srlCnt++;
 		}
 		closedir(dir);
-		names = malloc(sizeof(srlNames)*srlCnt);
-		memset(names,0,sizeof(srlNames)*srlCnt);
-		dir = opendir("/srl");
-		int i = 0;
-        while((dent=readdir(dir))!=NULL)
+		if(srlCnt)
 		{
-            if(strstr(dent->d_name,".srl") != NULL
-				|| strstr(dent->d_name,".nds") != NULL)
+			names = malloc(sizeof(srlNames)*srlCnt);
+			memset(names,0,sizeof(srlNames)*srlCnt);
+			dir = opendir("/srl");
+			int i = 0;
+			while((dent=readdir(dir))!=NULL)
 			{
-				strcpy(names[i].name,dent->d_name);
-				i++;
+				if(strstr(dent->d_name,".srl") != NULL
+					|| strstr(dent->d_name,".nds") != NULL)
+				{
+					strcpy(names[i].name,dent->d_name);
+					i++;
+				}
 			}
+			closedir(dir);
 		}
-		closedir(dir);
-    }
-	if(srlCnt == 0)
+	}
+	if(srlCnt == 0 || names == NULL)
 	{
 		printf("No Files! Make sure you have .srl/.nds files in your \"srl\" folder!\n");
 		VIDEO_WaitVSync();
@@ -511,6 +541,7 @@ int main()
 		VIDEO_WaitVSync();
 		VIDEO_WaitVSync();
 		sleep(5);
+		free(names);
 		return 0;
 	}
 	IOS_Ioctl(kd_fd, IOCTL_ExecSuspendScheduler, NULL, 0, &out, 4);
@@ -529,6 +560,7 @@ int main()
 		VIDEO_WaitVSync();
 		VIDEO_WaitVSync();
 		sleep(5);
+		free(names);
 		return 0;
 	}
 	memset(ncdOData, 0, 0x20);
@@ -545,10 +577,14 @@ int main()
 		VIDEO_WaitVSync();
 		VIDEO_WaitVSync();
 		sleep(5);
+		free(names);
 		return 0;
 	}
 
-	srlBuf = malloc(0x400000);
+	//allocate big buffers at once
+	__wd_hid = iosCreateHeap(0x8000);
+	arm_databuf = malloc(0x400000);
+	uint8_t *srlBuf = malloc(0x400000);
 
 	while(1)
 	{
@@ -604,45 +640,22 @@ int main()
 			fclose(f);
 			continue;
 		}
+
 		fread(srlBuf,srlSize,1,f);
 		fclose(f);
-		if(srlSize > 0x400000)
-		{
-			printf("ROM too big for NDS RAM!\n");
-			VIDEO_WaitVSync();
-			sleep(2);
-			fclose(f);
-			continue;
-		}
-		uint32_t tmp = 0x24FFAE51;
-		if(memcmp(srlBuf+0xC0, &tmp, 4) != 0)
-		{
-			printf("ROM Signature invalid!\n");
-			VIDEO_WaitVSync();
-			sleep(2);
-			continue;
-		}
-		memcpy(&tmp, srlBuf+0x80, 4);
-		uint32_t romlen = __builtin_bswap32(tmp);
-		if(romlen+0x88 > srlSize)
-		{
-			printf("ROM appears to be unsigned!\n");
-			VIDEO_WaitVSync();
-			sleep(2);
-			continue;
-		}
-		wd_state = WD_STATE_DSWAIT;
+		memcpy(srlHdr,srlBuf,0x160);
 
 		//Set up file buffer to send
-		memcpy(&tmp, srlBuf+0x20, 4);
+		uint32_t tmp;
+		memcpy(&tmp, srlHdr+0x20, 4);
 		uint32_t arm9off = __builtin_bswap32(tmp);
-		memcpy(&tmp, srlBuf+0x2C, 4);
+		memcpy(&tmp, srlHdr+0x2C, 4);
 		uint32_t arm9len = __builtin_bswap32(tmp);
 		uint32_t arm9cpLen = arm9len-(arm9len%0x1EA);
 
-		memcpy(&tmp, srlBuf+0x30, 4);
+		memcpy(&tmp, srlHdr+0x30, 4);
 		uint32_t arm7off = __builtin_bswap32(tmp);
-		memcpy(&tmp, srlBuf+0x3C, 4);
+		memcpy(&tmp, srlHdr+0x3C, 4);
 		uint32_t arm7len = __builtin_bswap32(tmp);
 		uint32_t arm7cpLen = arm7len-(arm7len%0x1EA);
 		
@@ -652,7 +665,15 @@ int main()
 		if(arm7cpLen < arm7len) //Add extra ARM7 Block to fill
 			arm_datalen_total+=0x1EA;
 
-		arm_databuf = malloc(arm_datalen_total);
+		if(arm_datalen_total > 0x400000)
+		{
+			printf("ARM Binaries too big for NDS RAM!\n");
+			VIDEO_WaitVSync();
+			sleep(2);
+			continue;
+		}
+
+		memset(arm_databuf, 0, arm_datalen_total);
 		arm_datapkg_total = arm_datalen_total/0x1EA;
 
 		uint32_t curOffset = 0;
@@ -674,9 +695,18 @@ int main()
 			memcpy(arm_databuf+curOffset, srlBuf+arm7off+arm7cpLen, arm7len-arm7cpLen);
 			curOffset += 0x1EA;
 		}
+		//Verify Header CRC16
+		wd_hdr_valid = dsVerifyHdr();
+		//Get Header Total ROM Length
+		memcpy(&tmp, srlHdr+0x80, 4);
+		uint32_t romlen = __builtin_bswap32(tmp);
+		//Signed ROMs always have a section after the ROM that starts with the string "ac"
+		wd_has_rsa = (romlen+0x88 <= srlSize && srlBuf[romlen] == 0x61 && srlBuf[romlen+1] == 0x63);
+		if(wd_has_rsa) memcpy(srlRSA, srlBuf+romlen, 0x88);
+		//Set start state
+		wd_state = WD_STATE_DSWAIT;
 
 		//WD_Startup
-		__wd_hid = iosCreateHeap(0x8000);
 		__wd_fd = IOS_Open("/dev/net/wd/command", 0x10001);
 		if(__wd_fd < 0 || __wd_hid < 0)	printf("WD_Startup=HID: %li, IOS_Open: %li\n", __wd_hid, __wd_fd);
 
@@ -742,7 +772,7 @@ int main()
 		iosFree(__wd_hid, wd_tmpBuf);
 
 		//Set up rest of Beacon Data
-		memcpy(&tmp, srlBuf+0x68, 4);
+		memcpy(&tmp, srlHdr+0x68, 4);
 		uint32_t iOff = __builtin_bswap32(tmp);
 		const uint8_t *pBin = srlBuf+iOff+0x220;
 		const uint8_t *cBin = srlBuf+iOff+0x20;
@@ -862,10 +892,12 @@ int main()
 
 		//WD_Cleanup
 		IOS_Close(__wd_fd);
-
-		free(arm_databuf);
 	}
+
+	//free all buffers at once
 	free(srlBuf);
+	free(arm_databuf);
+	free(names);
 
 	//NCDUnlockWirelessDriver
 	ncd_fd = IOS_Open("/dev/net/ncd/manage", 0);

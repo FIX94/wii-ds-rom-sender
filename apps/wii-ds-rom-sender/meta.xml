@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+	<app version="v1.1">
+		<name>Wii DS ROM Sender</name>
+		<coder>FIX94</coder>
+		<version>v2.0</version>
+		<release_date>20170622000000</release_date>
+		<short_description>Send NDS ROMs to a DS using DLP.</short_description>
+	</app>

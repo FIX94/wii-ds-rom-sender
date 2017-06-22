@@ -15,27 +15,51 @@
 #include <stdlib.h>
 #include <dirent.h>
 #include <fat.h>
+#include "ndsfile.h"
+
+extern uint8_t demomenu_bin[];
+extern uint32_t demomenu_bin_size;
 
 enum {
+	/* Download Play */
 	WD_STATE_DSWAIT = 0,
 	WD_STATE_GETNAME,
 	WD_STATE_SENDRSA,
 	WD_STATE_IDLERSA,
 	WD_STATE_SENDDATA,
 	WD_STATE_POSTSEND,
+	/* DS Download Station Emu */
+	WD_STATE_STATIONMENUWAIT,
+	WD_STATE_STATIONMENULENIDLE,
+	WD_STATE_STATIONMENULEN,
+	WD_STATE_STATIONMENUWAITLEN,
+	WD_STATE_STATIONMENUDATAIDLE,
+	WD_STATE_STATIONMENUDATA,
+	WD_STATE_STATIONMENUIDLE,
+	WD_STATE_STATIONWAITSELECT,
+	WD_STATE_STATIONDATALENIDLE,
+	WD_STATE_STATIONDATALEN,
+	WD_STATE_STATIONDATAWAITLEN,
+	WD_STATE_STATIONDATAIDLE,
+	WD_STATE_STATIONSENDDATA,
+	WD_STATE_STATIONPOST,
 };
 
 static volatile bool mpdl_active = false;
 static volatile bool wd_has_rsa = true;
 static volatile bool wd_hdr_valid = true;
+static volatile bool wd_haxxstation = false;
+static volatile bool gotResponse = false;
+static volatile bool sendError = false;
 static volatile uint8_t wd_namestate = 0;
 static volatile uint32_t wd_idle = 0;
 static volatile uint16_t wd_last_datapos = 0;
 static volatile uint16_t wd_datapos = 0;
 static volatile uint32_t wd_databufpos = 0;
 static volatile int wd_state = WD_STATE_DSWAIT;
-static char wd_c1_name[11];
+static volatile char wd_c1_name[11];
 static volatile int16_t connected = 0;
+static volatile bool beaconActive = true;
 
 //Using a total of 4 Threads
 #define STACKSIZE 0x8000
@@ -52,6 +76,8 @@ static lwp_t mpdl_send_thread_ptr;
 
 static uint8_t beaconBuf[0x20] __attribute__((aligned(32)));
 static uint8_t wdGameInfo[0x500] __attribute__((aligned(32)));
+static uint8_t *demodatabuf = NULL;
+static uint32_t demodatalen, demomenupkg, demodatapkg;
 static s32 __wd_fd, __wd_hid;
 
 static void* mpdl_thread(void * nul)
@@ -65,32 +91,34 @@ static void* mpdl_thread(void * nul)
 
 	while(mpdl_active)
 	{
-		memset(beaconBuf,0,0x20);
-		uint16_t beaconIn = (uint16_t)(ticks_to_microsecs(gettick())/64);
-		memcpy(beaconBuf, &beaconIn, 2);
+		if(beaconActive)
+		{
+			memset(beaconBuf,0,0x20);
+			uint16_t beaconIn = (uint16_t)(ticks_to_microsecs(gettick())/64);
+			memcpy(beaconBuf, &beaconIn, 2);
 
-		uint8_t *dat = wdGameInfo+(cInf<<7);
+			uint8_t *dat = wdGameInfo+(cInf<<7);
 
-		if(wd_state == WD_STATE_SENDDATA)
-			dat[0xB] = 2;
-		else
-			dat[0xB] = 3;
+			if(wd_state == WD_STATE_SENDDATA)
+				dat[0xB] = 2;
+			else
+				dat[0xB] = 3;
 
-		if(connected & (1<<1))
-			dat[0x16] = 1;
-		else
-			dat[0x16] = 0;
+			if(connected & (1<<1))
+				dat[0x16] = 1;
+			else
+				dat[0x16] = 0;
 
-		cfg[1].data = dat;
-		cfg[1].len = 0x80;
+			cfg[1].data = dat;
+			cfg[1].len = 0x80;
 
-		s32 ret = IOS_Ioctlv(__wd_fd, 0x1006, 2, 0, cfg);
-		if(ret != 0) printf("WD_SendBeacon Err %li\n", ret);
+			s32 ret = IOS_Ioctlv(__wd_fd, 0x1006, 2, 0, cfg);
+			if(ret != 0) printf("WD_SendBeacon Err %li\n", ret);
 
-		cInf++;
-		if(cInf >= 10)
-			cInf = 0;
-
+			cInf++;
+			if(cInf >= 10)
+				cInf = 0;
+		}
 		usleep(200*1000);
 	}
 	return nul;
@@ -126,9 +154,10 @@ static void* mpdl_inf_thread(void * nul)
 				{
 					connected |= (1<<chan);
 					wd_namestate = 0;
-					memset(wd_c1_name, 0, 11);
+					memset((void*)wd_c1_name, 0, 11);
 					wd_state = WD_STATE_GETNAME;
 					memcpy(chan1Con, wdReq+8, 6);
+					beaconActive = false;
 				}
 				else
 				{
@@ -144,8 +173,11 @@ static void* mpdl_inf_thread(void * nul)
 				{
 					connected &= ~(1<<chan);
 					wd_state = WD_STATE_DSWAIT;
+					beaconActive = true;
 				}
 			}
+			else if(ret == 5 && chan)
+				sendError = true;
 			else if(ret != 3)
 				printf("DS Ret %li Chan %i\n", ret, chan);
 		}
@@ -155,84 +187,155 @@ static void* mpdl_inf_thread(void * nul)
 
 static uint8_t wdRecvFrame[0x2000] __attribute__((aligned(32)));
 static ioctlv recv __attribute__((aligned(32)));
+static char stationname[10] = { 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20 };
 
 static void* mpdl_recv_thread(void * nul)
 {
-	memset(wd_c1_name, 0, 11);
+	memset((void*)wd_c1_name, 0, 11);
 	while(mpdl_active)
 	{
-		LWP_SuspendThread(LWP_GetSelf());
 		recv.data = wdRecvFrame;
 		recv.len = 0x2000;
 		s32 ret = IOS_Ioctlv(__wd_fd, 0x8000, 0, 1, &recv);
-		if(ret > 0xA && wdRecvFrame[0xB] > 0 && wdRecvFrame[0x12] == 4 && (wdRecvFrame[0x13]&0x7F) == 1)
+		if(ret > 0xA && wdRecvFrame[0xB] > 0 && wdRecvFrame[0x12] == 4)
 		{
+			uint8_t port = (wdRecvFrame[0x13]&0xF);
 			uint8_t reply = wdRecvFrame[0x14];
 			uint8_t seq = wdRecvFrame[0x15];
-			if(wd_state == WD_STATE_GETNAME && reply == 7 && seq < 5)
+			if(port == 1)
 			{
-				wd_namestate |= 1<<seq;
-				if(seq)
+				if(wd_state == WD_STATE_GETNAME && reply == 7 && seq < 5)
 				{
-					uint8_t off = (seq-1)*3;
-					wd_c1_name[off] = wdRecvFrame[0x16];
-					if(seq < 4)
+					wd_namestate |= 1<<seq;
+					if(seq)
 					{
-						wd_c1_name[off+1] = wdRecvFrame[0x18];
-						wd_c1_name[off+2] = wdRecvFrame[0x1A];
+						uint8_t off = (seq-1)*3;
+						wd_c1_name[off] = wdRecvFrame[0x16];
+						if(seq < 4)
+						{
+							wd_c1_name[off+1] = wdRecvFrame[0x18];
+							wd_c1_name[off+2] = wdRecvFrame[0x1A];
+						}
+					}
+					if(wd_namestate == 0x1F)
+					{
+						wd_state = WD_STATE_SENDRSA;
+						wd_datapos = 0;
+						wd_last_datapos = 0;
+						wd_databufpos = 0;
 					}
 				}
-				if(wd_namestate == 0x1F)
+				else if(wd_state == WD_STATE_SENDRSA && reply == 8)
 				{
-					wd_state = WD_STATE_SENDRSA;
-					wd_datapos = 0;
-					wd_last_datapos = 0;
-					wd_databufpos = 0;
-				}
-			}
-			else if(wd_state == WD_STATE_SENDRSA && reply == 8)
-			{
-				//printf("Sent RSA Signature\n");
-				wd_state = WD_STATE_IDLERSA;
-				wd_idle = 0;
-				//printf("Waiting for a bit\n");
-			}
-			else if(wd_state == WD_STATE_IDLERSA)
-			{
-				wd_idle++;
-				if(wd_idle >= 60)
-				{
-					wd_state = WD_STATE_SENDDATA;
-					//printf("Done Waiting, sending Data\n");
-				}
-			}
-			else if(wd_state == WD_STATE_SENDDATA)
-			{
-				if(reply == 9)
-				{
-					uint16_t tmp;
-					memcpy(&tmp, wdRecvFrame+0x17, 2);
-					uint16_t blocksReceived = __builtin_bswap16(tmp);
-					if(blocksReceived == (wd_last_datapos+1))
+					//printf("Sent RSA Signature to \"%.10s\"\n", wd_c1_name);
+					if(memcmp((void*)wd_c1_name, stationname, 10) == 0)
 					{
-						//printf("Accepted segment %i\n", wd_last_datapos);
-						if(wd_datapos)
-							wd_databufpos+=0x1EA;
-						wd_datapos++;
+						wd_state = WD_STATE_STATIONMENUWAIT;
+						wd_idle = 0;
+						//printf("Download Station Init\n");
+					}
+					else
+					{
+						wd_state = WD_STATE_IDLERSA;
+						wd_idle = 0;
+						//printf("Waiting for a bit\n");
 					}
 				}
-				else if(reply == 10)
+				else if(wd_state == WD_STATE_IDLERSA)
 				{
-					//printf("Done sending Data, sent %i segments\n", wd_datapos);
-					wd_state = WD_STATE_POSTSEND;
+					wd_idle++;
+					if(wd_idle >= 60)
+					{
+						wd_state = WD_STATE_SENDDATA;
+						//printf("Done Waiting, sending Data\n");
+					}
 				}
+				else if(wd_state == WD_STATE_SENDDATA)
+				{
+					if(reply == 9)
+					{
+						uint16_t tmp;
+						memcpy(&tmp, wdRecvFrame+0x15, 2);
+						uint16_t blocksReceivedA = __builtin_bswap16(tmp);
+						memcpy(&tmp, wdRecvFrame+0x17, 2);
+						uint16_t blocksReceivedB = __builtin_bswap16(tmp);
+						if((blocksReceivedA == (wd_last_datapos+1)) || (blocksReceivedB == (wd_last_datapos+1)))
+						{
+							//printf("Accepted segment %i\n", wd_last_datapos);
+							if(wd_datapos)
+								wd_databufpos+=0x1EA;
+							wd_datapos++;
+						}
+					}
+					else if(reply == 10)
+					{
+						//printf("Done sending Data, sent %i segments\n", wd_datapos);
+						wd_state = WD_STATE_POSTSEND;
+					}
+				}
+				else if(wd_state == WD_STATE_POSTSEND && reply == 11)
+				{
+					//printf("DS is starting\n");
+					//force disconnect channel 1
+					connected &= ~(1<<1);
+					wd_state = WD_STATE_DSWAIT;
+				}
+				else if(wd_state == WD_STATE_STATIONMENULENIDLE)
+				{
+					wd_idle++;
+					if(wd_idle >= 10)
+						wd_state = WD_STATE_STATIONMENULEN;
+				}
+				else if(wd_state == WD_STATE_STATIONDATALENIDLE)
+				{
+					wd_idle++;
+					if(wd_idle >= 10)
+						wd_state = WD_STATE_STATIONDATALEN;
+				}
+				else if(wd_state == WD_STATE_STATIONMENUDATAIDLE)
+				{
+					wd_idle++;
+					if(wd_idle >= 60)
+						wd_state = WD_STATE_STATIONMENUDATA;
+				}
+				else if(wd_state == WD_STATE_STATIONMENUIDLE)
+				{
+					wd_idle++;
+					if(wd_idle >= 5)
+						wd_state = WD_STATE_STATIONMENUDATA;
+				}
+				else if(wd_state == WD_STATE_STATIONDATAIDLE)
+				{
+					wd_idle++;
+					if(wd_idle >= 5)
+						wd_state = WD_STATE_STATIONSENDDATA;
+				}
+				else
+					gotResponse = true;
 			}
-			else if(wd_state == WD_STATE_POSTSEND && reply == 11)
+			else 
 			{
-				//printf("DS is starting\n");
-				//force disconnect channel 1
-				connected &= ~(1<<1);
-				wd_state = WD_STATE_DSWAIT;
+				if(port == 0xD && wd_state == WD_STATE_STATIONMENUWAIT && memcmp(wdRecvFrame+0x14, "demomenu", 8) == 0)
+				{
+					wd_idle = 0;
+					wd_state = WD_STATE_STATIONMENULENIDLE;
+				}
+				else if(port == 0xE && (wd_state == WD_STATE_STATIONMENULEN || wd_state == WD_STATE_STATIONMENUWAITLEN))
+				{
+					wd_idle = 0;
+					wd_state = WD_STATE_STATIONMENUDATAIDLE;
+				}
+				else if(port == 0xD && wd_state == WD_STATE_STATIONWAITSELECT && memcmp(wdRecvFrame+0x14, "file.nds", 8) == 0)
+				{
+					wd_idle = 0;
+					wd_state = WD_STATE_STATIONDATALENIDLE;
+					wd_datapos = 0xFFFE;
+				}
+				else if(port == 0xF && (wd_state == WD_STATE_STATIONDATALEN || wd_state == WD_STATE_STATIONDATAWAITLEN))
+				{
+					wd_idle = 0;
+					wd_state = WD_STATE_STATIONDATAIDLE;
+				}
 			}
 		}
 	}
@@ -263,6 +366,10 @@ static const uint8_t postsend_msg[5] = {
 	0x11, 0x01, 0x05, 0x00, 0x02
 };
 
+static const uint8_t stationlen_msg[10] = {
+	0x0D, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x02
+};
+
 static const uint8_t msg_end[2] = {
 	0x02, 0x00 
 };
@@ -282,97 +389,275 @@ static uint8_t *arm_databuf;
 static uint32_t arm_datalen_total;
 static uint16_t arm_datapkg_total;
 
+int sendVal = 0;
+static bool sendTimes(const uint8_t *send_buf, const u32 in_len, uint8_t times)
+{
+	if(sendVal < times)
+	{
+		if(sendVal && gotResponse && !sendError)
+		{
+			gotResponse = false;
+			sendVal++;
+		}
+		if(sendVal < times)
+		{
+			//clear send error
+			sendError = false;
+			wdDoSend(send_buf, in_len);
+			//only accept new response AFTER sending this block
+			gotResponse = false;
+			if(!sendVal) sendVal = 1;
+		}
+		return false;
+	}
+	else
+		return true;
+}
+
 static void* mpdl_send_thread(void * nul)
 {
 	uint8_t *wdSendBuf = iosAlloc(__wd_hid, 0x210);
+	//some raw WD config
+	memset(wdSendBuf+0x200,0,0x10);
+	wdSendBuf[0x207] = 0xC; //A and C works, C used by official games
+	wdSendBuf[0x209] = (1<<1); //only chan 1 atm
+	uint16_t tmp16, portLen;
+	uint32_t tmp32;
 	while(mpdl_active)
 	{
 		//Only handle Channel 1 for now
-		if((connected & (1<<1)) && LWP_ThreadIsSuspended(mpdl_recv_thread_ptr))
+		if((connected & (1<<1)))
 		{
-			//some raw WD config
-			memset(wdSendBuf+0x200,0,0x10);
-			wdSendBuf[0x207] = 0xA; //A and C works, C used by official games
-			wdSendBuf[0x209] = (1<<1); //only chan 1 atm
-
-			if(wd_state == WD_STATE_GETNAME)
+			switch(wd_state)
 			{
-				memcpy(wdSendBuf, id_req_msg, sizeof(id_req_msg));
-				wdDoSend(wdSendBuf, 6);
+				case WD_STATE_GETNAME:
+					memcpy(wdSendBuf, id_req_msg, sizeof(id_req_msg));
+					wdDoSend(wdSendBuf, 6);
+					usleep(6000);
+					break;
+				case WD_STATE_SENDRSA:
+					memcpy(wdSendBuf, rsa_msg_start, sizeof(rsa_msg_start));
+					memcpy(wdSendBuf+0x3, srlHdr+0x24, 4); //ARM9 Entry
+					memcpy(wdSendBuf+0x7, srlHdr+0x34, 4); //ARM7 Entry
+					tmp32 = __builtin_bswap32(0x027FFE00);
+					memcpy(wdSendBuf+0xF, &tmp32, 4); //Header Dest 1
+					memcpy(wdSendBuf+0x13, &tmp32, 4); //Header Dest 2
+					tmp32 = __builtin_bswap32(0x160);
+					memcpy(wdSendBuf+0x17, &tmp32, 4); //Header Len
+					memcpy(wdSendBuf+0x1F, srlHdr+0x28, 4); //ARM9 Dest (tmp)
+					memcpy(wdSendBuf+0x23, srlHdr+0x28, 4); //ARM9 Dest (actual)
+					memcpy(wdSendBuf+0x27, srlHdr+0x2C, 4); //ARM9 Size
+					tmp32 = __builtin_bswap32(0x022C0000);
+					memcpy(wdSendBuf+0x2F, &tmp32, 4); //ARM7 Dest (tmp)
+					memcpy(wdSendBuf+0x33, srlHdr+0x38, 4); //ARM7 Dest (actual)
+					memcpy(wdSendBuf+0x37, srlHdr+0x3C, 4); //ARM7 Size
+					tmp32 = __builtin_bswap32(1);
+					memcpy(wdSendBuf+0x3B, &tmp32, 4); //RSA Header End
+					if(wd_has_rsa) //RSA Data
+						memcpy(wdSendBuf+0x3F, srlRSA, 0x88);
+					memcpy(wdSendBuf+0xE8, msg_end, sizeof(msg_end));
+					//printf("Sending RSA Signature\n");
+					wdDoSend(wdSendBuf, 0xEA);
+					usleep(6000);
+					break;
+				case WD_STATE_SENDDATA:
+					wd_last_datapos = wd_datapos;
+					uint32_t sendLen;
+					if(wd_datapos == 0)
+					{
+						memcpy(wdSendBuf, hdr_msg_start, sizeof(hdr_msg_start));
+						tmp16 = __builtin_bswap16(wd_datapos);
+						memcpy(wdSendBuf+5, &tmp16, 2);
+						memcpy(wdSendBuf+7, srlHdr, 0x160);
+						memcpy(wdSendBuf+0x168, msg_end, sizeof(msg_end));
+						sendLen = 0x16A;
+					}
+					else
+					{
+						memcpy(wdSendBuf, data_msg_start, sizeof(data_msg_start));
+						tmp16 = __builtin_bswap16(wd_datapos);
+						memcpy(wdSendBuf+5, &tmp16, 2);
+						memcpy(wdSendBuf+7, arm_databuf+wd_databufpos, 0x1EA);
+						memcpy(wdSendBuf+0x1F1, &tmp16, 1);
+						memcpy(wdSendBuf+0x1F2, msg_end, sizeof(msg_end));
+						sendLen = 0x1F4;
+					}
+					wdDoSend(wdSendBuf, sendLen);
+					usleep(6000);
+					break;
+				case WD_STATE_POSTSEND:
+					memcpy(wdSendBuf, postsend_msg, sizeof(postsend_msg));
+					wdDoSend(wdSendBuf, 6);
+					usleep(6000);
+					break;
+				case WD_STATE_STATIONMENULEN:
+					memcpy(wdSendBuf, stationlen_msg, sizeof(stationlen_msg));
+					tmp32 = __builtin_bswap32(demomenu_bin_size);
+					memcpy(wdSendBuf+2, &tmp32, 4);
+					memset(wdSendBuf+6, 0, 2);
+					memcpy(wdSendBuf+8, msg_end, sizeof(msg_end));
+					if(sendTimes(wdSendBuf, 10, 32))
+					{
+						sendVal = 0;
+						wd_state = WD_STATE_STATIONMENUWAITLEN;
+					}
+					usleep(6000);
+					break;
+				case WD_STATE_STATIONMENUDATA:
+					wd_idle = 0;
+					tmp16 = __builtin_bswap16(wd_datapos);
+					portLen = 0x1E00;
+					if(demomenu_bin_size == wd_databufpos)
+					{
+						portLen |= 1;
+						memcpy(wdSendBuf, &portLen, 2);
+						memcpy(wdSendBuf+2, &tmp16, 2);
+						memcpy(wdSendBuf+4, (void*)&wd_datapos, 2);
+						memcpy(wdSendBuf+6, msg_end, sizeof(msg_end));
+						if(sendTimes(wdSendBuf, 8, 32))
+						{
+							sendVal = 0;
+							wd_state = WD_STATE_STATIONWAITSELECT;
+						}
+					}
+					else if((demomenu_bin_size-wd_databufpos) <= 0x1E)
+					{
+						portLen |= ((demomenu_bin_size-wd_databufpos)>>1)+1;
+						memcpy(wdSendBuf, &portLen, 2);
+						memcpy(wdSendBuf+2, &tmp16, 2);
+						memcpy(wdSendBuf+4, demomenu_bin+wd_databufpos, (demomenu_bin_size-wd_databufpos));
+						memcpy(wdSendBuf+4+(demomenu_bin_size-wd_databufpos), (void*)&wd_datapos, 2);
+						memcpy(wdSendBuf+6+(demomenu_bin_size-wd_databufpos), msg_end, sizeof(msg_end));
+						if(sendTimes(wdSendBuf, 8+(demomenu_bin_size-wd_databufpos), 32))
+						{
+							sendVal = 0;
+							wd_datapos = 0xFFFF;
+							wd_databufpos = demomenu_bin_size;
+							wd_state = WD_STATE_STATIONMENUIDLE;
+						}
+					}
+					else
+					{
+						portLen |= 0x10;
+						memcpy(wdSendBuf, &portLen, 2);
+						memcpy(wdSendBuf+2, &tmp16, 2);
+						memcpy(wdSendBuf+4, demomenu_bin+wd_databufpos, 0x1E);
+						memcpy(wdSendBuf+0x22, (void*)&wd_datapos, 2);
+						memcpy(wdSendBuf+0x24, msg_end, sizeof(msg_end));
+						if(sendTimes(wdSendBuf, 0x26, wd_datapos ? 2 : 32))
+						{
+							sendVal = 0;
+							wd_datapos++;
+							wd_databufpos+=0x1E;
+							if(demomenu_bin_size == wd_databufpos)
+							{
+								wd_state = WD_STATE_STATIONMENUIDLE;
+								wd_datapos = 0xFFFF;
+							}
+						}
+					}
+					usleep(2500);
+					break;
+				case WD_STATE_STATIONDATALEN:
+					memcpy(wdSendBuf, stationlen_msg, sizeof(stationlen_msg));
+					tmp32 = __builtin_bswap32(demodatalen);
+					memcpy(wdSendBuf+2, &tmp32, 4);
+					memset(wdSendBuf+6, 1, 2);
+					memcpy(wdSendBuf+8, msg_end, sizeof(msg_end));
+					if(sendTimes(wdSendBuf, 10, 32))
+					{
+						sendVal = 0;
+						wd_state = WD_STATE_STATIONDATAWAITLEN;
+					}
+					usleep(6000);
+					break;
+				case WD_STATE_STATIONSENDDATA:
+					wd_idle = 0;
+					tmp16 = __builtin_bswap16(wd_datapos);
+					portLen = 0x1F00;
+					if(wd_datapos == 0xFFFE)
+					{
+						portLen |= 0x10;
+						memcpy(wdSendBuf, &portLen, 2);
+						memcpy(wdSendBuf+2, &tmp16, 2);
+						memset(wdSendBuf+4, 0, 0x1E);
+						memcpy(wdSendBuf+0x22, (void*)&wd_datapos, 2);
+						memcpy(wdSendBuf+0x24, msg_end, sizeof(msg_end));
+						if(sendTimes(wdSendBuf, 0x26, 32))
+						{
+							sendVal = 0;
+							wd_datapos = 0;
+							wd_databufpos = 0;
+						}
+					}
+					else if(demodatalen == wd_databufpos)
+					{
+						portLen |= 1;
+						memcpy(wdSendBuf, &portLen, 2);
+						memcpy(wdSendBuf+2, &tmp16, 2);
+						memcpy(wdSendBuf+4, (void*)&wd_datapos, 2);
+						memcpy(wdSendBuf+6, msg_end, sizeof(msg_end));
+						if(sendTimes(wdSendBuf, 8, 32))
+						{
+							sendVal = 0;
+							wd_state = WD_STATE_STATIONPOST;
+						}
+					}
+					else if((demodatalen-wd_databufpos) <= 0x7E)
+					{
+						portLen |= ((demodatalen-wd_databufpos)>>1)+1;
+						memcpy(wdSendBuf, &portLen, 2);
+						memcpy(wdSendBuf+2, &tmp16, 2);
+						memcpy(wdSendBuf+4, demodatabuf+wd_databufpos, (demodatalen-wd_databufpos));
+						memcpy(wdSendBuf+4+(demodatalen-wd_databufpos),(void*) &wd_datapos, 2);
+						memcpy(wdSendBuf+6+(demodatalen-wd_databufpos), msg_end, sizeof(msg_end));
+						if(sendTimes(wdSendBuf, 8+(demodatalen-wd_databufpos), 32))
+						{
+							sendVal = 0;
+							wd_datapos = 0xFFFF;
+							wd_databufpos = demodatalen;
+							wd_state = WD_STATE_STATIONDATAIDLE;
+						}
+					}
+					else
+					{
+						portLen |= 0x40;
+						memcpy(wdSendBuf, &portLen, 2);
+						memcpy(wdSendBuf+2, &tmp16, 2);
+						memcpy(wdSendBuf+4, demodatabuf+wd_databufpos, 0x7E);
+						memcpy(wdSendBuf+0x82, (void*)&wd_datapos, 2);
+						memcpy(wdSendBuf+0x84, msg_end, sizeof(msg_end));
+						if(sendTimes(wdSendBuf, 0x86, wd_datapos ? 2 : 32))
+						{
+							sendVal = 0;
+							wd_datapos++;
+							wd_databufpos+=0x7E;
+							if(demodatalen == wd_databufpos)
+							{
+								wd_state = WD_STATE_STATIONDATAIDLE;
+								wd_datapos = 0xFFFF;
+							}
+							continue;
+						}
+					}
+					usleep(2400);
+					break;
+				default:
+					memcpy(wdSendBuf, idle_msg, sizeof(idle_msg));
+					wdDoSend(wdSendBuf, 4);
+					usleep(6000);
+					break;
 			}
-			else if(wd_state == WD_STATE_SENDRSA)
-			{
-				memcpy(wdSendBuf, rsa_msg_start, sizeof(rsa_msg_start));
-				memcpy(wdSendBuf+0x3, srlHdr+0x24, 4); //ARM9 Entry
-				memcpy(wdSendBuf+0x7, srlHdr+0x34, 4); //ARM7 Entry
-				uint32_t tmp = __builtin_bswap32(0x027FFE00);
-				memcpy(wdSendBuf+0xF, &tmp, 4); //Header Dest 1
-				memcpy(wdSendBuf+0x13, &tmp, 4); //Header Dest 2
-				tmp = __builtin_bswap32(0x160);
-				memcpy(wdSendBuf+0x17, &tmp, 4); //Header Len
-				memcpy(wdSendBuf+0x1F, srlHdr+0x28, 4); //ARM9 Dest (tmp)
-				memcpy(wdSendBuf+0x23, srlHdr+0x28, 4); //ARM9 Dest (actual)
-				memcpy(wdSendBuf+0x27, srlHdr+0x2C, 4); //ARM9 Size
-				tmp = __builtin_bswap32(0x022C0000);
-				memcpy(wdSendBuf+0x2F, &tmp, 4); //ARM7 Dest (tmp)
-				memcpy(wdSendBuf+0x33, srlHdr+0x38, 4); //ARM7 Dest (actual)
-				memcpy(wdSendBuf+0x37, srlHdr+0x3C, 4); //ARM7 Size
-				tmp = __builtin_bswap32(1);
-				memcpy(wdSendBuf+0x3B, &tmp, 4); //RSA Header End
-				if(wd_has_rsa) //RSA Data
-					memcpy(wdSendBuf+0x3F, srlRSA, 0x88);
-				memcpy(wdSendBuf+0xE8, msg_end, sizeof(msg_end));
-				//printf("Sending RSA Signature\n");
-				wdDoSend(wdSendBuf, 0xEA);
-			}
-			else if(wd_state == WD_STATE_SENDDATA)
-			{
-				wd_last_datapos = wd_datapos;
-				if(wd_datapos == 0)
-				{
-					memcpy(wdSendBuf, hdr_msg_start, sizeof(hdr_msg_start));
-					uint16_t tmp = __builtin_bswap16(wd_datapos);
-					memcpy(wdSendBuf+5, &tmp, 2);
-					memcpy(wdSendBuf+7, srlHdr, 0x160);
-					memcpy(wdSendBuf+0x168, msg_end, sizeof(msg_end));
-					wdDoSend(wdSendBuf, 0x16A);
-				}
-				else
-				{
-					memcpy(wdSendBuf, data_msg_start, sizeof(data_msg_start));
-					uint16_t tmp = __builtin_bswap16(wd_datapos);
-					memcpy(wdSendBuf+5, &tmp, 2);
-					memcpy(wdSendBuf+7, arm_databuf+wd_databufpos, 0x1EA);
-					memcpy(wdSendBuf+0x1F2, msg_end, sizeof(msg_end));
-					wdDoSend(wdSendBuf, 0x1F4);
-				}
-			}
-			else if(wd_state == WD_STATE_POSTSEND)
-			{
-				memcpy(wdSendBuf, postsend_msg, sizeof(postsend_msg));
-				wdDoSend(wdSendBuf, 6);
-			}
-			else  //unhandled state, keep alive
-			{
-				memcpy(wdSendBuf, idle_msg, sizeof(idle_msg));
-				wdDoSend(wdSendBuf, 4);
-			}
-			LWP_ResumeThread(mpdl_recv_thread_ptr);
 		}
 		else
 			usleep(500);
 	}
-
 	//some raw WD config
-	memset(wdSendBuf+0x200,0,0x10);
-	wdSendBuf[0x207] = 0xA; //A and C works, C used by official games
 	wdSendBuf[0x209] = 0; //send to ourself
 
 	//Force wake up Receive Thread by sending something
 	memcpy(wdSendBuf, idle_msg, sizeof(idle_msg));
 	wdDoSend(wdSendBuf, 4);
-
-	LWP_ResumeThread(mpdl_recv_thread_ptr);
 
 	iosFree(__wd_hid, wdSendBuf);
 
@@ -392,15 +677,16 @@ static void printmain()
 {
 	printf("\x1b[2J");
 	printf("\x1b[37m");
-	printf("Wii DS ROM Sender v1.1 by FIX94\n\n");
+	printf("Wii DS ROM Sender v2.0 by FIX94\n");
+	printf("HaxxStation by shutterbug2000, Gericom, and Apache Thunder\n\n");
 }
 
 static void printstatus()
 {
 	if(!wd_hdr_valid)
-		printf("WARNING: ROM Header appears to be invalid, it may not work\n");
-	if(!wd_has_rsa)
-		printf("WARNING: ROM unsigned, it will only work on a DS with FlashMe\n");
+		printf("WARNING:\nROM Header appears to be invalid, it may not work\n");
+	if(!wd_has_rsa && !wd_haxxstation)
+		printf("WARNING:\nNo HaxxStation and ROM unsigned, it will only work on a DS with FlashMe\n");
 	printf("Current Status:\n");
 	if(!inited)
 		printf("Initializing System, this may take a while\n");
@@ -426,6 +712,48 @@ static void printstatus()
 			case WD_STATE_POSTSEND:
 				printf("Done Sending Data to DS!\n");
 				break;
+			case WD_STATE_STATIONMENUWAIT:
+				printf("[Download Station] Connected!\n");
+				break;
+			case WD_STATE_STATIONMENULENIDLE:
+				printf("[Download Station] Waiting\n");
+				break;
+			case WD_STATE_STATIONMENULEN:
+				printf("[Download Station] Sending Menu Length\n");
+				break;
+			case WD_STATE_STATIONMENUWAITLEN:
+				printf("[Download Station] Waiting for Menu Length Response\n");
+				break;
+			case WD_STATE_STATIONMENUDATAIDLE:
+				printf("[Download Station] Preparing to send Menu\n");
+				break;
+			case WD_STATE_STATIONMENUDATA:
+				printf("[Download Station] Sending Menu (%i/%li Packets)\n", wd_datapos, demomenupkg);
+				break;
+			case WD_STATE_STATIONMENUIDLE:
+				printf("[Download Station] Menu Sent!\n");
+				break;
+			case WD_STATE_STATIONWAITSELECT:
+				printf("[Download Station] Waiting for Game Selection\n");
+				break;
+			case WD_STATE_STATIONDATALENIDLE:
+				printf("[Download Station] Waiting\n");
+				break;
+			case WD_STATE_STATIONDATALEN:
+				printf("[Download Station] Sending Game Length\n");
+				break;
+			case WD_STATE_STATIONDATAWAITLEN:
+				printf("[Download Station] Waiting for Game Length Response\n");
+				break;
+			case WD_STATE_STATIONDATAIDLE:
+				printf("[Download Station] Preparing to send Game\n");
+				break;
+			case WD_STATE_STATIONSENDDATA:
+				printf("[Download Station] Sending Game (%i/%li Packets)\n", wd_datapos, demodatapkg);
+				break;
+			case WD_STATE_STATIONPOST:
+				printf("[Download Station] Game Sent!\n");
+				break;
 		}
 	}
 }
@@ -438,25 +766,9 @@ static int compare (const void * a, const void * b ) {
 	return strcmp((*(srlNames*)a).name, (*(srlNames*)b).name);
 }
 
-//DS CRC16 Function
-static const uint16_t crcTbl[16] = {
-	0x0000, 0xCC01, 0xD801, 0x1400, 0xF001, 0x3C00, 0x2800, 0xE401,
-	0xA001, 0x6C00, 0x7800, 0xB401, 0x5000, 0x9C01, 0x8801, 0x4400,
-};
 static bool dsVerifyHdr()
 {
-	uint16_t crc = 0xFFFF;
-	int i, j;
-	for(i = 0; i < 0x15E; i+=2)
-	{
-		uint16_t curval = srlHdr[i]|(srlHdr[i+1]<<8);
-		for(j = 0; j < 0x10; j+= 4)
-		{
-			uint16_t tmp = crcTbl[crc&0xF]^crcTbl[(curval>>j)&0xF];
-			crc >>= 4;
-			crc ^= tmp;
-		}
-	}
+	uint16_t crc = ndsfile_crc(srlHdr, 0x15E);
 	uint16_t inCrc = srlHdr[0x15E]|(srlHdr[0x15F]<<8);
 	return (crc == inCrc);
 }
@@ -586,6 +898,8 @@ int main()
 	arm_databuf = malloc(0x400000);
 	uint8_t *srlBuf = malloc(0x400000);
 
+	uint8_t tmpWdIconBuf[0x220];
+
 	while(1)
 	{
 		bool selected = false;
@@ -640,8 +954,30 @@ int main()
 			fclose(f);
 			continue;
 		}
+		if(ndsfile_station_open())
+		{
+			size_t tmpLen;
+			demodatalen = srlSize;
+			if(!ndsfile_station_getfile(srlBuf,&srlSize,"ds_demo_client.srl") ||
+				!ndsfile_station_getfile(tmpWdIconBuf,&tmpLen,"icon.nbfp") ||
+				!ndsfile_station_getfile(tmpWdIconBuf+0x20,&tmpLen,"icon.nbfc"))
+			{
+				printf("Invalid haxxstation.nds! Sending file directly\n");
+				sleep(2);
+				srlSize = demodatalen;
+			}
+			else
+			{
+				wd_haxxstation = true;
+				demodatabuf = ndsfile_haxx_start(f, &demodatalen);
+				demomenupkg = demomenu_bin_size/0x1E;
+				demodatapkg = demodatalen/0x7E;
+			}
+			ndsfile_station_close();
+		}
+		if(!wd_haxxstation)
+			fread(srlBuf,srlSize,1,f);
 
-		fread(srlBuf,srlSize,1,f);
 		fclose(f);
 		memcpy(srlHdr,srlBuf,0x160);
 
@@ -740,9 +1076,11 @@ int main()
 
 		//Set Start Beacon Data, no clue what all these values mean
 		wdGameInfo[0] = 1; wdGameInfo[2] = 1; wdGameInfo[3] = 8;
-		wdGameInfo[4] = 0x26; wdGameInfo[5] = 5; wdGameInfo[6] = 0x40;
-		//random every boot?
-		wdGameInfo[8] = 0xE9; wdGameInfo[9] = 0x90;
+		//DS Download Station GGID
+		wdGameInfo[4] = 0x20; wdGameInfo[5] = 1; wdGameInfo[6] = 0x40;
+		//TGID, random every host
+		uint16_t rval = gettick();
+		wdGameInfo[8] = (rval>>8); wdGameInfo[9] = (rval&0xFF);
 		//more unkown values, appear to be similar to first set
 		wdGameInfo[0xC] = 0xF0; wdGameInfo[0xD] = 1; wdGameInfo[0xE] = 8;
 
@@ -753,8 +1091,8 @@ int main()
 		wdGameInfo[0xA] = 0x70;
 		//Beacon type
 		wdGameInfo[0xB] = 3;
-		//more unkown values, appear to be similar to first set
-		wdGameInfo[0x10] = 0x26; wdGameInfo[0x11] = 5; wdGameInfo[0x12] = 0x40;
+		//DS Download Station GGID (again)
+		wdGameInfo[0x10] = 0x20; wdGameInfo[0x11] = 1; wdGameInfo[0x12] = 0x40;
 
 		//WD_SetLinkState
 		uint32_t enable = 1;
@@ -774,8 +1112,18 @@ int main()
 		//Set up rest of Beacon Data
 		memcpy(&tmp, srlHdr+0x68, 4);
 		uint32_t iOff = __builtin_bswap32(tmp);
-		const uint8_t *pBin = srlBuf+iOff+0x220;
-		const uint8_t *cBin = srlBuf+iOff+0x20;
+		const uint8_t *pBin;
+		const uint8_t *cBin;
+		if(wd_haxxstation)
+		{
+			pBin = tmpWdIconBuf;
+			cBin = tmpWdIconBuf+0x20;
+		}
+		else
+		{
+			pBin = srlBuf+iOff+0x220;
+			cBin = srlBuf+iOff+0x20;
+		}
 		//Set up Beacon PAL and CHAR Data from ROM
 		memcpy(wdGameInfo+0x1E, pBin, 0x20);
 		memcpy(wdGameInfo+0x3E, cBin, 0x42);
@@ -851,6 +1199,7 @@ int main()
 
 		//MPDLStartup Threads
 		mpdl_active = true;
+		beaconActive = true;
 		//Beacon Thread
 		LWP_CreateThread(&mpdl_thread_ptr,mpdl_thread,NULL,mpdl_stack,STACKSIZE,0x40);
 		//Status Thread
@@ -892,6 +1241,13 @@ int main()
 
 		//WD_Cleanup
 		IOS_Close(__wd_fd);
+
+		if(wd_haxxstation)
+		{
+			ndsfile_haxx_end();
+			demodatabuf = NULL;
+			wd_haxxstation = false;
+		}
 	}
 
 	//free all buffers at once

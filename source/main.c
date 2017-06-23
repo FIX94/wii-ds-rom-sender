@@ -389,6 +389,20 @@ static uint8_t *arm_databuf;
 static uint32_t arm_datalen_total;
 static uint16_t arm_datapkg_total;
 
+static const uint16_t sleepArr[5][3] = 
+{
+	{ 6000, 2500, 2400 },
+	{ 7500, 3125, 3000 },
+	{ 9000, 3750, 3600 },
+	{10500, 4375, 4200 },
+	{12000, 5000, 4800 },
+};
+static const char sleepDispArr[5][6] = 
+{
+	"1x", "1.25x", "1.5x", "1.75x", "2x",
+};
+static uint8_t sleepVal;
+
 int sendVal = 0;
 static bool sendTimes(const uint8_t *send_buf, const u32 in_len, uint8_t times)
 {
@@ -433,7 +447,7 @@ static void* mpdl_send_thread(void * nul)
 				case WD_STATE_GETNAME:
 					memcpy(wdSendBuf, id_req_msg, sizeof(id_req_msg));
 					wdDoSend(wdSendBuf, 6);
-					usleep(6000);
+					usleep(sleepArr[sleepVal][0]);
 					break;
 				case WD_STATE_SENDRSA:
 					memcpy(wdSendBuf, rsa_msg_start, sizeof(rsa_msg_start));
@@ -458,7 +472,7 @@ static void* mpdl_send_thread(void * nul)
 					memcpy(wdSendBuf+0xE8, msg_end, sizeof(msg_end));
 					//printf("Sending RSA Signature\n");
 					wdDoSend(wdSendBuf, 0xEA);
-					usleep(6000);
+					usleep(sleepArr[sleepVal][0]);
 					break;
 				case WD_STATE_SENDDATA:
 					wd_last_datapos = wd_datapos;
@@ -483,12 +497,12 @@ static void* mpdl_send_thread(void * nul)
 						sendLen = 0x1F4;
 					}
 					wdDoSend(wdSendBuf, sendLen);
-					usleep(6000);
+					usleep(sleepArr[sleepVal][0]);
 					break;
 				case WD_STATE_POSTSEND:
 					memcpy(wdSendBuf, postsend_msg, sizeof(postsend_msg));
 					wdDoSend(wdSendBuf, 6);
-					usleep(6000);
+					usleep(sleepArr[sleepVal][0]);
 					break;
 				case WD_STATE_STATIONMENULEN:
 					memcpy(wdSendBuf, stationlen_msg, sizeof(stationlen_msg));
@@ -501,7 +515,7 @@ static void* mpdl_send_thread(void * nul)
 						sendVal = 0;
 						wd_state = WD_STATE_STATIONMENUWAITLEN;
 					}
-					usleep(6000);
+					usleep(sleepArr[sleepVal][0]);
 					break;
 				case WD_STATE_STATIONMENUDATA:
 					wd_idle = 0;
@@ -556,7 +570,7 @@ static void* mpdl_send_thread(void * nul)
 							}
 						}
 					}
-					usleep(2500);
+					usleep(sleepArr[sleepVal][1]);
 					break;
 				case WD_STATE_STATIONDATALEN:
 					memcpy(wdSendBuf, stationlen_msg, sizeof(stationlen_msg));
@@ -569,7 +583,7 @@ static void* mpdl_send_thread(void * nul)
 						sendVal = 0;
 						wd_state = WD_STATE_STATIONDATAWAITLEN;
 					}
-					usleep(6000);
+					usleep(sleepArr[sleepVal][0]);
 					break;
 				case WD_STATE_STATIONSENDDATA:
 					wd_idle = 0;
@@ -640,12 +654,12 @@ static void* mpdl_send_thread(void * nul)
 							continue;
 						}
 					}
-					usleep(2400);
+					usleep(sleepArr[sleepVal][2]);
 					break;
 				default:
 					memcpy(wdSendBuf, idle_msg, sizeof(idle_msg));
 					wdDoSend(wdSendBuf, 4);
-					usleep(6000);
+					usleep(sleepArr[sleepVal][0]);
 					break;
 			}
 		}
@@ -677,7 +691,7 @@ static void printmain()
 {
 	printf("\x1b[2J");
 	printf("\x1b[37m");
-	printf("Wii DS ROM Sender v2.0 by FIX94\n");
+	printf("Wii DS ROM Sender v2.1 by FIX94\n");
 	printf("HaxxStation by shutterbug2000, Gericom, and Apache Thunder\n\n");
 }
 
@@ -912,6 +926,8 @@ int main()
 			printmain();
 			printf("Select ROM file or press HOME/START to exit\n");
 			printf("<< %s >>\n",names[i].name);
+			printf("Press B to change the delay timing\n");
+			printf("Delay Timing: %s\n", sleepDispArr[sleepVal]);
 
 			VIDEO_WaitVSync();
 			VIDEO_WaitVSync();
@@ -922,6 +938,12 @@ int main()
 			{
 				selected = true;
 				break;
+			}
+			else if((btns & PAD_BUTTON_B) || (wbtns & WPAD_BUTTON_B))
+			{
+				sleepVal++;
+				if(sleepVal >= 5)
+					sleepVal = 0;
 			}
 			else if((btns & PAD_BUTTON_RIGHT) || (wbtns & WPAD_BUTTON_RIGHT))
 			{

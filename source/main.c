@@ -17,8 +17,11 @@
 #include <fat.h>
 #include "ndsfile.h"
 
-extern uint8_t demomenu_bin[];
-extern uint32_t demomenu_bin_size;
+extern uint8_t gameyob_bin[];
+extern uint32_t gameyob_bin_size;
+
+extern uint8_t nesds_bin[];
+extern uint32_t nesds_bin_size;
 
 enum {
 	/* Download Play */
@@ -76,8 +79,8 @@ static lwp_t mpdl_send_thread_ptr;
 
 static uint8_t beaconBuf[0x20] __attribute__((aligned(32)));
 static uint8_t wdGameInfo[0x500] __attribute__((aligned(32)));
-static uint8_t *demodatabuf = NULL;
-static uint32_t demodatalen, demomenupkg, demodatapkg;
+static uint8_t *demomenubuf = NULL, *demodatabuf = NULL;
+static uint32_t demomenulen, demodatalen, demomenupkg, demodatapkg;
 static s32 __wd_fd, __wd_hid;
 
 static void* mpdl_thread(void * nul)
@@ -401,7 +404,8 @@ static const char sleepDispArr[5][6] =
 {
 	"1x", "1.25x", "1.5x", "1.75x", "2x",
 };
-static uint8_t sleepVal;
+
+static uint8_t sleepVal = 0;
 
 int sendVal = 0;
 static bool sendTimes(const uint8_t *send_buf, const u32 in_len, uint8_t times)
@@ -506,7 +510,7 @@ static void* mpdl_send_thread(void * nul)
 					break;
 				case WD_STATE_STATIONMENULEN:
 					memcpy(wdSendBuf, stationlen_msg, sizeof(stationlen_msg));
-					tmp32 = __builtin_bswap32(demomenu_bin_size);
+					tmp32 = __builtin_bswap32(demomenulen);
 					memcpy(wdSendBuf+2, &tmp32, 4);
 					memset(wdSendBuf+6, 0, 2);
 					memcpy(wdSendBuf+8, msg_end, sizeof(msg_end));
@@ -521,7 +525,7 @@ static void* mpdl_send_thread(void * nul)
 					wd_idle = 0;
 					tmp16 = __builtin_bswap16(wd_datapos);
 					portLen = 0x1E00;
-					if(demomenu_bin_size == wd_databufpos)
+					if(demomenulen == wd_databufpos)
 					{
 						portLen |= 1;
 						memcpy(wdSendBuf, &portLen, 2);
@@ -534,19 +538,19 @@ static void* mpdl_send_thread(void * nul)
 							wd_state = WD_STATE_STATIONWAITSELECT;
 						}
 					}
-					else if((demomenu_bin_size-wd_databufpos) <= 0x1E)
+					else if((demomenulen-wd_databufpos) <= 0x1E)
 					{
-						portLen |= ((demomenu_bin_size-wd_databufpos)>>1)+1;
+						portLen |= ((demomenulen-wd_databufpos)>>1)+1;
 						memcpy(wdSendBuf, &portLen, 2);
 						memcpy(wdSendBuf+2, &tmp16, 2);
-						memcpy(wdSendBuf+4, demomenu_bin+wd_databufpos, (demomenu_bin_size-wd_databufpos));
-						memcpy(wdSendBuf+4+(demomenu_bin_size-wd_databufpos), (void*)&wd_datapos, 2);
-						memcpy(wdSendBuf+6+(demomenu_bin_size-wd_databufpos), msg_end, sizeof(msg_end));
-						if(sendTimes(wdSendBuf, 8+(demomenu_bin_size-wd_databufpos), 32))
+						memcpy(wdSendBuf+4, demomenubuf+wd_databufpos, (demomenulen-wd_databufpos));
+						memcpy(wdSendBuf+4+(demomenulen-wd_databufpos), (void*)&wd_datapos, 2);
+						memcpy(wdSendBuf+6+(demomenulen-wd_databufpos), msg_end, sizeof(msg_end));
+						if(sendTimes(wdSendBuf, 8+(demomenulen-wd_databufpos), 32))
 						{
 							sendVal = 0;
 							wd_datapos = 0xFFFF;
-							wd_databufpos = demomenu_bin_size;
+							wd_databufpos = demomenulen;
 							wd_state = WD_STATE_STATIONMENUIDLE;
 						}
 					}
@@ -555,7 +559,7 @@ static void* mpdl_send_thread(void * nul)
 						portLen |= 0x10;
 						memcpy(wdSendBuf, &portLen, 2);
 						memcpy(wdSendBuf+2, &tmp16, 2);
-						memcpy(wdSendBuf+4, demomenu_bin+wd_databufpos, 0x1E);
+						memcpy(wdSendBuf+4, demomenubuf+wd_databufpos, 0x1E);
 						memcpy(wdSendBuf+0x22, (void*)&wd_datapos, 2);
 						memcpy(wdSendBuf+0x24, msg_end, sizeof(msg_end));
 						if(sendTimes(wdSendBuf, 0x26, wd_datapos ? 2 : 32))
@@ -563,7 +567,7 @@ static void* mpdl_send_thread(void * nul)
 							sendVal = 0;
 							wd_datapos++;
 							wd_databufpos+=0x1E;
-							if(demomenu_bin_size == wd_databufpos)
+							if(demomenulen == wd_databufpos)
 							{
 								wd_state = WD_STATE_STATIONMENUIDLE;
 								wd_datapos = 0xFFFF;
@@ -691,7 +695,7 @@ static void printmain()
 {
 	printf("\x1b[2J");
 	printf("\x1b[37m");
-	printf("Wii DS ROM Sender v2.1 by FIX94\n");
+	printf("Wii DS ROM Sender v3.0 by FIX94\n");
 	printf("HaxxStation by shutterbug2000, Gericom, and Apache Thunder\n\n");
 }
 
@@ -811,12 +815,16 @@ int main()
 	printmain();
 	printstatus();
 
+	printf("Reloading into IOS21\n");
 	//Known to properly work with DS
 	IOS_ReloadIOS(21);
 
+	printf("PAD Init\n");
 	PAD_Init();
 	WPAD_Init();
+	printf("FAT Init\n");
 	fatInitDefault();
+	printf("Parsing srl directory\n");
 	int srlCnt = 0;
 	DIR *dir = opendir("/srl");
 	struct dirent *dent = NULL;
@@ -826,7 +834,9 @@ int main()
 		while((dent=readdir(dir))!=NULL)
 		{
 			if(strstr(dent->d_name,".srl") != NULL
-				|| strstr(dent->d_name,".nds") != NULL)
+				|| strstr(dent->d_name,".nds") != NULL
+				|| strstr(dent->d_name,".gb") != NULL
+				|| strstr(dent->d_name,".nes") != NULL)
 				srlCnt++;
 		}
 		closedir(dir);
@@ -839,7 +849,9 @@ int main()
 			while((dent=readdir(dir))!=NULL)
 			{
 				if(strstr(dent->d_name,".srl") != NULL
-					|| strstr(dent->d_name,".nds") != NULL)
+					|| strstr(dent->d_name,".nds") != NULL
+					|| strstr(dent->d_name,".gb") != NULL
+					|| strstr(dent->d_name,".nes") != NULL)
 				{
 					strcpy(names[i].name,dent->d_name);
 					i++;
@@ -857,6 +869,8 @@ int main()
 		return 0;
 	}
 	qsort(names, srlCnt, sizeof(srlNames), compare);
+
+	printf("Stopping WC24\n");
 
 	//WC24SuspendScheduler
 	u32 out = 0;
@@ -876,6 +890,8 @@ int main()
 		IOS_Ioctl(kd_fd, 6, NULL, 0, kdData, 0x20);
 	} while(kdData[0] < 0);
 	IOS_Close(kd_fd);
+
+	printf("Locking Wireless Driver\n");
 
 	//NCDLockWirelessDriver
 	ioctlv ncdl;
@@ -907,10 +923,15 @@ int main()
 		return 0;
 	}
 
+	//make sure LZO is ready when we need it
+	demomenubuf = ndsfile_demomenu_start(&demomenulen);
+
 	//allocate big buffers at once
 	__wd_hid = iosCreateHeap(0x8000);
 	arm_databuf = malloc(0x400000);
 	uint8_t *srlBuf = malloc(0x400000);
+	//for HaxxStation
+	uint8_t *clientBuf = malloc(0x400000);
 
 	uint8_t tmpWdIconBuf[0x220];
 
@@ -968,39 +989,78 @@ int main()
 		fseek(f,0,SEEK_END);
 		size_t srlSize = ftell(f);
 		rewind(f);
-		if(srlSize > 0x400000)
+		if(strstr(names[i].name,".gb") != 0)
 		{
-			printf("ROM too big for NDS RAM!\n");
-			VIDEO_WaitVSync();
-			sleep(2);
+			if(srlSize > 0x200000)
+			{
+				printf("ROM too big for NDS RAM!\n");
+				VIDEO_WaitVSync();
+				sleep(2);
+				fclose(f);
+				continue;
+			}
+			memcpy(srlBuf,gameyob_bin,gameyob_bin_size);
+			fread(srlBuf+0x9B0B0,1,srlSize,f);
 			fclose(f);
-			continue;
+			//gameyob uses length for bank count
+			uint32_t wLen = __builtin_bswap32(srlSize);
+			memcpy(srlBuf+0x29B0B0,&wLen,4);
+		}
+		else if(strstr(names[i].name,".nes") != 0)
+		{
+			if(srlSize > 0x200000)
+			{
+				printf("ROM too big for NDS RAM!\n");
+				VIDEO_WaitVSync();
+				sleep(2);
+				fclose(f);
+				continue;
+			}
+			memcpy(srlBuf,nesds_bin,nesds_bin_size);
+			fread(srlBuf+0xDA60,1,srlSize,f);
+			fclose(f);
+			//nesds does not need length
+		}
+		else
+		{
+			if(srlSize > 0x400000)
+			{
+				printf("ROM too big for NDS RAM!\n");
+				VIDEO_WaitVSync();
+				sleep(2);
+				fclose(f);
+				continue;
+			}
+			fread(srlBuf,1,srlSize,f);
+			fclose(f);
 		}
 		if(ndsfile_station_open())
 		{
 			size_t tmpLen;
-			demodatalen = srlSize;
-			if(!ndsfile_station_getfile(srlBuf,&srlSize,"ds_demo_client.srl") ||
+			size_t clientSize;
+			if(!ndsfile_station_getfile(clientBuf,&clientSize,"ds_demo_client.srl") ||
 				!ndsfile_station_getfile(tmpWdIconBuf,&tmpLen,"icon.nbfp") ||
 				!ndsfile_station_getfile(tmpWdIconBuf+0x20,&tmpLen,"icon.nbfc"))
 			{
 				printf("Invalid haxxstation.nds! Sending file directly\n");
 				sleep(2);
-				srlSize = demodatalen;
 			}
 			else
 			{
 				wd_haxxstation = true;
-				demodatabuf = ndsfile_haxx_start(f, &demodatalen);
-				demomenupkg = demomenu_bin_size/0x1E;
+				//move srlBuf
+				demodatalen = srlSize;
+				demodatabuf = ndsfile_haxx_start(srlBuf, &demodatalen);
+				demomenupkg = demomenulen/0x1E;
 				demodatapkg = demodatalen/0x7E;
+				//replace srlBuf with client now
+				memcpy(srlBuf, clientBuf, clientSize);
+				srlSize = clientSize;
 			}
 			ndsfile_station_close();
 		}
-		if(!wd_haxxstation)
-			fread(srlBuf,srlSize,1,f);
 
-		fclose(f);
+		//srlBuf contains file to send
 		memcpy(srlHdr,srlBuf,0x160);
 
 		//Set up file buffer to send
@@ -1273,9 +1333,13 @@ int main()
 	}
 
 	//free all buffers at once
+	free(clientBuf);
 	free(srlBuf);
 	free(arm_databuf);
 	free(names);
+
+	//No need for LZO anymore
+	ndsfile_demomenu_end();
 
 	//NCDUnlockWirelessDriver
 	ncd_fd = IOS_Open("/dev/net/ncd/manage", 0);

@@ -9,6 +9,7 @@
 #include <malloc.h>
 #include <string.h>
 #include <inttypes.h>
+#include <lzo/lzo1x.h>
 #include "ndsfile.h"
 
 static bool station_open = false;
@@ -159,13 +160,71 @@ static const uint8_t arm7Fix[] =
 	0x00, 0x00, 0x00, 0x00, 0x38, 0x00, 0x00, 0x00
 };
 
+static const uint8_t lzoHdr[] = {'L', 'Z' , 'O', 'n', 0x00, 0x2F, 0xF1, 0x71};
+
+static void ndsfile_lzocmp(uint8_t **iobuf, uint32_t *iolen)
+{
+	uint8_t *inbuf = *iobuf;
+	uint32_t inlen = *iolen;
+	//prepare for the probably worst case
+	uint8_t *tmpbuf = malloc((inlen*2)+0x10);
+	uint8_t *cmpbuf = tmpbuf+0x10;
+	uint32_t cmplen = 0;
+	//try compressing to get send times down
+	printf("Compressing\n");
+	uint8_t *wrkbuf = malloc(LZO1X_999_MEM_COMPRESS);
+	lzo1x_999_compress(inbuf, inlen, cmpbuf, &cmplen, wrkbuf);
+	free(wrkbuf);
+	if(cmplen && cmplen+0x10 < inlen)
+	{
+		//optimize for decompression speed on ds itself
+		lzo1x_optimize(cmpbuf, cmplen, inbuf, &inlen, NULL);
+		//identification header for client
+		memcpy(tmpbuf, lzoHdr, 8);
+		//surprisingly enough big endian
+		memcpy(tmpbuf+8, &inlen, 4);
+		memcpy(tmpbuf+0xC, &cmplen, 4);
+		//take newly compressed file
+		free(inbuf);
+		*iobuf = tmpbuf;
+		//align to 2-byte short length
+		*iolen = ((cmplen+0x10)+1)&~1;
+	}
+	else //keep uncompressed
+		free(tmpbuf);
+}
+
+extern uint8_t demomenu_bin[];
+extern uint32_t demomenu_bin_size;
+
+static uint8_t *menubuf = NULL;
+uint8_t *ndsfile_demomenu_start(uint32_t *len)
+{
+	//first lzo call so do lzo init
+	lzo_init();
+	//copy menu into separate buffer
+	uint32_t total_len = demomenu_bin_size;
+	uint8_t *menubuf = malloc(total_len);
+	memcpy(menubuf, demomenu_bin, total_len);
+	//try compressing
+	*len = total_len;
+	ndsfile_lzocmp(&menubuf, len);
+	return menubuf;
+}
+
+void ndsfile_demomenu_end()
+{
+	if(menubuf)
+		free(menubuf);
+	menubuf = NULL;
+}
+
 static uint8_t *haxxbuf = NULL;
 
-uint8_t *ndsfile_haxx_start(FILE *f, uint32_t *len)
+uint8_t *ndsfile_haxx_start(const uint8_t *oriBuf, uint32_t *len)
 {
-	fseek(f,0,SEEK_SET);
 	uint8_t oriHdr[0x160];
-	fread(oriHdr,1,0x160,f);
+	memcpy(oriHdr,oriBuf,0x160);
 
 	//Set up ARM9 Data
 	uint32_t tmp;
@@ -178,8 +237,7 @@ uint8_t *ndsfile_haxx_start(FILE *f, uint32_t *len)
 	memcpy(&tmp, oriHdr+0x2C, 4);
 	uint32_t arm9len = __builtin_bswap32(tmp);
 	uint8_t *arm9buf = malloc(arm9len);
-	fseek(f,arm9off,SEEK_SET);
-	fread(arm9buf,1,arm9len,f);
+	memcpy(arm9buf,oriBuf+arm9off,arm9len);
 	//Set up ARM7 Data
 	memcpy(&tmp, oriHdr+0x30, 4);
 	uint32_t arm7off = __builtin_bswap32(tmp);
@@ -195,8 +253,7 @@ uint8_t *ndsfile_haxx_start(FILE *f, uint32_t *len)
 	{
 		arm7buf = malloc(arm7len+sizeof(arm7Fix));
 		memcpy(arm7buf, arm7Fix, sizeof(arm7Fix));
-		fseek(f,arm7off,SEEK_SET);
-		fread(arm7buf+sizeof(arm7Fix),1,arm7len,f);
+		memcpy(arm7buf+sizeof(arm7Fix),oriBuf+arm7off,arm7len);
 		//Secure original ARM7 vals in ARM7 Fix
 		memcpy(arm7buf+0x28, oriHdr+0x34, 4);
 		memcpy(arm7buf+0x2C, oriHdr+0x38, 4);
@@ -208,8 +265,7 @@ uint8_t *ndsfile_haxx_start(FILE *f, uint32_t *len)
 	else
 	{
 		arm7buf = malloc(arm7len);
-		fseek(f,arm7off,SEEK_SET);
-		fread(arm7buf,1,arm7len,f);
+		memcpy(arm7buf,oriBuf+arm7off,arm7len);
 	}
 	uint32_t arm9len_align = (arm9len+0x1FF)&(~0x1FF);
 	uint32_t arm7len_align = (arm7len+0x1FF)&(~0x1FF);
@@ -284,8 +340,9 @@ uint8_t *ndsfile_haxx_start(FILE *f, uint32_t *len)
 	memcpy(haxxbuf+arm9off,arm9buf,arm9len);
 	memcpy(haxxbuf+arm7off,arm7buf,arm7len);
 
-	//done!
+	//try compressing
 	*len = total_len;
+	ndsfile_lzocmp(&haxxbuf, len);
 	return haxxbuf;
 }
 

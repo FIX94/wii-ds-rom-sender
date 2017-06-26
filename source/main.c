@@ -682,8 +682,6 @@ static void* mpdl_send_thread(void * nul)
 	return nul;
 }
 
-static s32 kdData[8] __attribute__((aligned(32)));
-
 static uint8_t ncdIData[0x20] __attribute__((aligned(32)));
 static uint8_t ncdOData[0x20] __attribute__((aligned(32)));
 
@@ -695,7 +693,7 @@ static void printmain()
 {
 	printf("\x1b[2J");
 	printf("\x1b[37m");
-	printf("Wii DS ROM Sender v3.0 by FIX94\n");
+	printf("Wii DS ROM Sender v3.1 by FIX94\n");
 	printf("HaxxStation by shutterbug2000, Gericom, and Apache Thunder\n\n");
 }
 
@@ -885,10 +883,6 @@ int main()
 		return 0;
 	}
 	IOS_Ioctl(kd_fd, IOCTL_ExecSuspendScheduler, NULL, 0, &out, 4);
-	kdData[0] = -1;
-	do {
-		IOS_Ioctl(kd_fd, 6, NULL, 0, kdData, 0x20);
-	} while(kdData[0] < 0);
 	IOS_Close(kd_fd);
 
 	printf("Locking Wireless Driver\n");

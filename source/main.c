@@ -697,7 +697,7 @@ static void printmain()
 {
 	printf("\x1b[2J");
 	printf("\x1b[37m");
-	printf("Wii DS ROM Sender v3.2 by FIX94\n");
+	printf("Wii DS ROM Sender v3.3 by FIX94\n");
 	printf("HaxxStation by shutterbug2000, Gericom, and Apache Thunder\n\n");
 }
 
@@ -960,28 +960,33 @@ int main()
 				WiiDRC_ScanPads();
 				drcbtns = WiiDRC_ButtonsDown();
 			}
-			if((btns & PAD_BUTTON_A) || (wbtns & WPAD_BUTTON_A) || (drcbtns & WIIDRC_BUTTON_A))
+			if((btns & PAD_BUTTON_A) || (wbtns & WPAD_BUTTON_A) || 
+				(wbtns & WPAD_CLASSIC_BUTTON_A)  || (drcbtns & WIIDRC_BUTTON_A))
 			{
 				selected = true;
 				break;
 			}
-			else if((btns & PAD_BUTTON_B) || (wbtns & WPAD_BUTTON_B) || (drcbtns & WIIDRC_BUTTON_B))
+			else if((btns & PAD_BUTTON_B) || (wbtns & WPAD_BUTTON_B) || 
+				(wbtns & WPAD_CLASSIC_BUTTON_B) || (drcbtns & WIIDRC_BUTTON_B))
 			{
 				sleepVal++;
 				if(sleepVal >= 5)
 					sleepVal = 0;
 			}
-			else if((btns & PAD_BUTTON_RIGHT) || (wbtns & WPAD_BUTTON_RIGHT) || (drcbtns & WIIDRC_BUTTON_RIGHT))
+			else if((btns & PAD_BUTTON_RIGHT) || (wbtns & WPAD_BUTTON_RIGHT) || 
+				(wbtns & WPAD_CLASSIC_BUTTON_RIGHT) || (drcbtns & WIIDRC_BUTTON_RIGHT))
 			{
 				i++;
 				if(i >= srlCnt) i = 0;
 			}
-			else if((btns & PAD_BUTTON_LEFT) || (wbtns & WPAD_BUTTON_LEFT) || (drcbtns & WIIDRC_BUTTON_LEFT))
+			else if((btns & PAD_BUTTON_LEFT) || (wbtns & WPAD_BUTTON_LEFT) || 
+				(wbtns & WPAD_CLASSIC_BUTTON_LEFT) || (drcbtns & WIIDRC_BUTTON_LEFT))
 			{
 				i--;
 				if(i < 0) i = (srlCnt-1);
 			}
-			else if((btns & PAD_BUTTON_START) || (wbtns & WPAD_BUTTON_HOME) || (drcbtns & WIIDRC_BUTTON_HOME))
+			else if((btns & PAD_BUTTON_START) || (wbtns & WPAD_BUTTON_HOME) || 
+				(wbtns & WPAD_CLASSIC_BUTTON_HOME) || (drcbtns & WIIDRC_BUTTON_HOME))
 				break;
 		}
 		if(!selected)

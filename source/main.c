@@ -7,6 +7,7 @@
 #include <gccore.h>
 #include <stdio.h>
 #include <wiiuse/wpad.h>
+#include <wiidrc/wiidrc.h>
 #include <ogc/lwp_watchdog.h>
 #include <inttypes.h>
 #include <malloc.h>
@@ -258,16 +259,13 @@ static void* mpdl_recv_thread(void * nul)
 					if(reply == 9)
 					{
 						uint16_t tmp;
-						memcpy(&tmp, wdRecvFrame+0x15, 2);
-						uint16_t blocksReceivedA = __builtin_bswap16(tmp);
-						memcpy(&tmp, wdRecvFrame+0x17, 2);
-						uint16_t blocksReceivedB = __builtin_bswap16(tmp);
-						if((blocksReceivedA == (wd_last_datapos+1)) || (blocksReceivedB == (wd_last_datapos+1)))
+						//memcpy(&tmp, wdRecvFrame+0x15, 2); //stat, blocks received in a row
+						memcpy(&tmp, wdRecvFrame+0x17, 2); //next requested block
+						wd_datapos = __builtin_bswap16(tmp);
+						if(wd_datapos > 0) //0 is hdr, 1-end is rom
 						{
-							//printf("Accepted segment %i\n", wd_last_datapos);
-							if(wd_datapos)
-								wd_databufpos+=0x1EA;
-							wd_datapos++;
+							//printf("Requested ROM segment %i\n", wd_datapos-1);
+							wd_databufpos=(0x1EA*(wd_datapos-1)); //ROM segment is always 0x1EA bytes
 						}
 					}
 					else if(reply == 10)
@@ -432,6 +430,10 @@ static bool sendTimes(const uint8_t *send_buf, const u32 in_len, uint8_t times)
 		return true;
 }
 
+//new package only gets sent when this number here
+//changed from the previous package number, else
+//WD just thinks its the same package again
+static uint8_t packnum = 0;
 static void* mpdl_send_thread(void * nul)
 {
 	uint8_t *wdSendBuf = iosAlloc(__wd_hid, 0x210);
@@ -473,6 +475,7 @@ static void* mpdl_send_thread(void * nul)
 					memcpy(wdSendBuf+0x3B, &tmp32, 4); //RSA Header End
 					if(wd_has_rsa) //RSA Data
 						memcpy(wdSendBuf+0x3F, srlRSA, 0x88);
+					memcpy(wdSendBuf+0xE7, &packnum, 1); packnum++;
 					memcpy(wdSendBuf+0xE8, msg_end, sizeof(msg_end));
 					//printf("Sending RSA Signature\n");
 					wdDoSend(wdSendBuf, 0xEA);
@@ -487,6 +490,7 @@ static void* mpdl_send_thread(void * nul)
 						tmp16 = __builtin_bswap16(wd_datapos);
 						memcpy(wdSendBuf+5, &tmp16, 2);
 						memcpy(wdSendBuf+7, srlHdr, 0x160);
+						memcpy(wdSendBuf+0x167, &packnum, 1); packnum++;
 						memcpy(wdSendBuf+0x168, msg_end, sizeof(msg_end));
 						sendLen = 0x16A;
 					}
@@ -496,7 +500,7 @@ static void* mpdl_send_thread(void * nul)
 						tmp16 = __builtin_bswap16(wd_datapos);
 						memcpy(wdSendBuf+5, &tmp16, 2);
 						memcpy(wdSendBuf+7, arm_databuf+wd_databufpos, 0x1EA);
-						memcpy(wdSendBuf+0x1F1, &tmp16, 1);
+						memcpy(wdSendBuf+0x1F1, &packnum, 1); packnum++;
 						memcpy(wdSendBuf+0x1F2, msg_end, sizeof(msg_end));
 						sendLen = 0x1F4;
 					}
@@ -693,7 +697,7 @@ static void printmain()
 {
 	printf("\x1b[2J");
 	printf("\x1b[37m");
-	printf("Wii DS ROM Sender v3.1 by FIX94\n");
+	printf("Wii DS ROM Sender v3.2 by FIX94\n");
 	printf("HaxxStation by shutterbug2000, Gericom, and Apache Thunder\n\n");
 }
 
@@ -820,6 +824,7 @@ int main()
 	printf("PAD Init\n");
 	PAD_Init();
 	WPAD_Init();
+	WiiDRC_Init();
 	printf("FAT Init\n");
 	fatInitDefault();
 	printf("Parsing srl directory\n");
@@ -949,28 +954,34 @@ int main()
 
 			u32 btns = PAD_ButtonsDown(0);
 			u32 wbtns = WPAD_ButtonsDown(0);
-			if((btns & PAD_BUTTON_A) || (wbtns & WPAD_BUTTON_A))
+			u32 drcbtns = 0;
+			if(WiiDRC_Inited() && WiiDRC_Connected())
+			{
+				WiiDRC_ScanPads();
+				drcbtns = WiiDRC_ButtonsDown();
+			}
+			if((btns & PAD_BUTTON_A) || (wbtns & WPAD_BUTTON_A) || (drcbtns & WIIDRC_BUTTON_A))
 			{
 				selected = true;
 				break;
 			}
-			else if((btns & PAD_BUTTON_B) || (wbtns & WPAD_BUTTON_B))
+			else if((btns & PAD_BUTTON_B) || (wbtns & WPAD_BUTTON_B) || (drcbtns & WIIDRC_BUTTON_B))
 			{
 				sleepVal++;
 				if(sleepVal >= 5)
 					sleepVal = 0;
 			}
-			else if((btns & PAD_BUTTON_RIGHT) || (wbtns & WPAD_BUTTON_RIGHT))
+			else if((btns & PAD_BUTTON_RIGHT) || (wbtns & WPAD_BUTTON_RIGHT) || (drcbtns & WIIDRC_BUTTON_RIGHT))
 			{
 				i++;
 				if(i >= srlCnt) i = 0;
 			}
-			else if((btns & PAD_BUTTON_LEFT) || (wbtns & WPAD_BUTTON_LEFT))
+			else if((btns & PAD_BUTTON_LEFT) || (wbtns & WPAD_BUTTON_LEFT) || (drcbtns & WIIDRC_BUTTON_LEFT))
 			{
 				i--;
 				if(i < 0) i = (srlCnt-1);
 			}
-			else if((btns & PAD_BUTTON_START) || (wbtns & WPAD_BUTTON_HOME))
+			else if((btns & PAD_BUTTON_START) || (wbtns & WPAD_BUTTON_HOME) || (drcbtns & WIIDRC_BUTTON_HOME))
 				break;
 		}
 		if(!selected)
@@ -1294,7 +1305,12 @@ int main()
 			if (PAD_ButtonsDown(0) || PAD_ButtonsHeld(0) || 
 				WPAD_ButtonsDown(0) || WPAD_ButtonsHeld(0))
 				break;
-
+			if(WiiDRC_Inited() && WiiDRC_Connected())
+			{
+				WiiDRC_ScanPads();
+				if(WiiDRC_ButtonsDown() || WiiDRC_ButtonsHeld())
+					break;
+			}
 			printmain();
 			printstatus();
 
